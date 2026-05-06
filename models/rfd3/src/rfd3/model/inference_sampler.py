@@ -8,6 +8,11 @@ import torch
 from jaxtyping import Float
 from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 from rfd3.model.cfg_utils import strip_X
+from rfd3.model.floating_motif_projection import (
+    project_floating_motifs_all_atom,
+    remove_floating_motif_atoms_from_fixed_mask,
+    should_project_floating_motifs,
+)
 
 from foundry.common import exists
 from foundry.utils.alignment import weighted_rigid_align
@@ -50,6 +55,12 @@ class SampleDiffusionConfig:
     use_classifier_free_guidance: bool = False
     cfg_scale: float = 2.0
     cfg_t_max: float | None = None
+
+    # Inference-only approximation of independently floating contig motifs.
+    floating_motif_project: bool = False
+    floating_motif_project_every: int = 1
+    floating_motif_burn_in: int = 0
+    floating_motif_stop_after: int | None = None
 
     # Recycling
     n_recycle: int | None = None  # Override model default n_recycle for inference
@@ -153,9 +164,17 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         initializer_outputs,
         ref_initializer_outputs: dict[str, Any] | None,
         f_ref: dict[str, Any] | None,
+        floating_motif_refs=None,
     ) -> dict[str, Any]:
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
+        fixed_coord_noise_mask = (
+            remove_floating_motif_atoms_from_fixed_mask(
+                is_motif_atom_with_fixed_coord, floating_motif_refs
+            )
+            if self.floating_motif_project
+            else is_motif_atom_with_fixed_coord
+        )
 
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
@@ -171,11 +190,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             D=D,
             L=L,
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
-            is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
+            is_motif_atom_with_fixed_coord=fixed_coord_noise_mask,
         )  # (D, L, 3)
 
         if self.s_jitter_origin > 0.0:
-            X_L[:, is_motif_atom_with_fixed_coord, :] += torch.normal(
+            X_L[:, fixed_coord_noise_mask, :] += torch.normal(
                 mean=0.0,
                 std=self.s_jitter_origin,
                 size=(D, 1, 3),
@@ -223,7 +242,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
             )
-            epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
+            epsilon_L[..., fixed_coord_noise_mask, :] = (
                 0  # No noise injection for fixed atoms
             )
             X_noisy_L = X_L + epsilon_L
@@ -318,6 +337,14 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
             # Update the coordinates, scaled by the step size
             X_L = X_noisy_L + step_scale * d_t * delta_L
+            if should_project_floating_motifs(
+                step_num,
+                enabled=self.floating_motif_project,
+                project_every=self.floating_motif_project_every,
+                burn_in=self.floating_motif_burn_in,
+                stop_after=self.floating_motif_stop_after,
+            ):
+                X_L = project_floating_motifs_all_atom(X_L, floating_motif_refs)
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
@@ -392,10 +419,18 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         initializer_outputs,
         ref_initializer_outputs: dict[str, Any] | None,
         f_ref: dict[str, Any] | None,
+        floating_motif_refs=None,
         **_,
     ) -> dict[str, Any]:
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
+        fixed_coord_noise_mask = (
+            remove_floating_motif_atoms_from_fixed_mask(
+                is_motif_atom_with_fixed_coord, floating_motif_refs
+            )
+            if self.floating_motif_project
+            else is_motif_atom_with_fixed_coord
+        )
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
             device=coord_atom_lvl_to_be_noised.device,
@@ -409,7 +444,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             D=D,
             L=L,
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
-            is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
+            is_motif_atom_with_fixed_coord=fixed_coord_noise_mask,
         )  # (D, L, 3)
 
         X_noisy_L_traj = []
@@ -453,7 +488,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
             )
-            epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
+            epsilon_L[..., fixed_coord_noise_mask, :] = (
                 0  # No noise injection for fixed atoms
             )
 
@@ -524,6 +559,14 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # Update the coordinates, scaled by the step size
             # delta_L should be symmetric
             X_L = X_noisy_L + step_scale * d_t * delta_L
+            if should_project_floating_motifs(
+                step_num,
+                enabled=self.floating_motif_project,
+                project_every=self.floating_motif_project_every,
+                burn_in=self.floating_motif_burn_in,
+                stop_after=self.floating_motif_stop_after,
+            ):
+                X_L = project_floating_motifs_all_atom(X_L, floating_motif_refs)
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (

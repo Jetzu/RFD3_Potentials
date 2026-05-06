@@ -53,6 +53,30 @@ Additional unnecessary (but useful!) options are added to the above command:
 - `prevalidate_inputs`: Checks that your inputs are valid before running inference. Helpful if your JSON/YAML has a number of different configs you want to debug / double check are valid before loading the checkpoints.
 - `skip_existing`: Skips any existing files that would be in the same place and have the same name as the calculation being run. If you are testing your setup multiple times, including this option is important so that you actually run RFdiffusion3. 
 
+### Floating rigid motif projection
+
+RFD3 now has an optional inference-only floating rigid motif projection mode for contig-specified motifs. When enabled, indexed motif segments from the existing `contig` specification are still noised and denoised normally at each sampling step, then each non-contiguous motif segment is independently Kabsch-aligned back to its stored original all-atom input geometry. The reference geometry is captured from the input structure after contig construction and symmetry/origin handling, before diffused coordinates are zeroed for sampling. This is an inference-time approximation of floating-anchor diffusion behavior, not a training change or model architecture change.
+
+Defaults preserve previous behavior. Enable it with Hydra config overrides:
+
+```bash
+rfd3 design out_dir=logs/inference_outs/demo/0 inputs=models/rfd3/docs/examples/demo.json \
+  inference_sampler.floating_motif_project=True \
+  inference_sampler.floating_motif_project_every=5 \
+  inference_sampler.floating_motif_burn_in=20
+```
+
+The `rfd3 design` CLI also accepts shorthand flags:
+
+```bash
+rfd3 design out_dir=logs/inference_outs/demo/0 inputs=models/rfd3/docs/examples/demo.json \
+  --floating_motif_project \
+  --floating_motif_project_every 5 \
+  --floating_motif_burn_in 20
+```
+
+Available sampler keys are `floating_motif_project` (default `False`), `floating_motif_project_every` (default `1`), `floating_motif_burn_in` (default `0`), and `floating_motif_stop_after` (default `null`).
+
 There are various interesting ways you can use RFD3 beyond [Atom14](https://www.biorxiv.org/content/10.1101/2024.08.16.608235v4) design as it's trained on a large array of different tasks.
 For example, you can fix sequence and not structure (prediction-type task), fix the backbone and unfix the sequence (MPNN-type inverse folding) or unfix the sidechains only (PLACER/ChemNet-style):
 
